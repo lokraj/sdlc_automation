@@ -1,5 +1,7 @@
-#!/usr/bin/env python3
+
 # DevFlow: Jira ↔ Amazon Q ↔ Tests automation
+
+
 
 from __future__ import annotations
 import re
@@ -35,6 +37,7 @@ MAX_JIRA_COMMENT = 24000  # lower to account for ADF overhead and avoid CONTENT_
 # ---------- helpers ----------
 
 def ensure_env() -> None:
+    """Validate required Jira env vars are set; exit with code 2 if not."""
     problems = []
     if not JIRA_BASE:
         problems.append("JIRA_BASE_URL")
@@ -50,9 +53,11 @@ def ensure_env() -> None:
         raise typer.Exit(code=2)
 
 def ensure_dirs() -> None:
+    """Ensure DevFlow’s working directory (`.q/`) exists."""
     QDIR.mkdir(exist_ok=True)
 
 def run(cmd: list[str], cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
+    """Run a subprocess command and return the completed process (no exception on failure)."""
     return subprocess.run(
         cmd,
         cwd=str(cwd) if cwd else None,
@@ -62,6 +67,7 @@ def run(cmd: list[str], cwd: Optional[Path] = None) -> subprocess.CompletedProce
     )
 
 def have(cmd_name: str) -> bool:
+    """Return True if the given executable is available on PATH."""
     return shutil.which(cmd_name) is not None
 
 # Cleanup helper for pytest import/collection issues
@@ -69,6 +75,7 @@ def have(cmd_name: str) -> bool:
 # Call this before/after test runs to avoid 'import file mismatch' errors
 
 def _cleanup_pytest_artifacts(root: Path) -> None:
+    """Remove common pytest/python bytecode caches to avoid collection/import mismatch issues."""
     cache = root / ".pytest_cache"
     if cache.exists():
         shutil.rmtree(cache, ignore_errors=True)
@@ -85,6 +92,7 @@ def strip_ansi(text: str) -> str:
     return re.sub(r"\x1b\[[0-9;]*m", "", text or "")
 
 def jira_req(method: str, path: str, **kw) -> requests.Response:
+    """Make an authenticated Jira REST call (raises on HTTP >= 300)."""
     ensure_env()
     url = f"{JIRA_BASE}{path}"
     kw.setdefault("auth", (JIRA_EMAIL, JIRA_TOKEN))
@@ -98,10 +106,36 @@ def jira_req(method: str, path: str, **kw) -> requests.Response:
     return r
 
 def jira_get_issue(key: str) -> dict:
+    """Fetch a Jira issue as JSON (includes `renderedFields`)."""
     r = jira_req("GET", f"/rest/api/3/issue/{key}?expand=renderedFields")
     return r.json()
 
+def post_action(issue_key: str, message: str, title: str = "DevFlow") -> None:
+    """
+    Best-effort “action log” comment poster.
+
+    - Posts a single-line informational comment to the Jira issue.
+    - Never raises (so it won't break workflows when Jira env isn't configured).
+    """
+    if not (JIRA_BASE and JIRA_EMAIL and JIRA_TOKEN):
+        return
+    msg = " ".join((message or "").strip().split())
+    if not msg:
+        return
+    try:
+        # Uses the *authoritative* `jira_comment` defined later in this module.
+        jira_comment(issue_key, msg, title=title)
+    except Exception:
+        # Intentionally swallow all errors: action logging must be non-blocking.
+        return
+
 def jira_comment(key: str, body_md: str) -> None:
+    """
+    LEGACY Jira comment poster (plain text/markdown body).
+
+    NOTE: This function is intentionally redefined later to post robust ADF
+    code blocks and chunk safely. The later definition is the one used at runtime.
+    """
     # Strip ANSI and chunk conservatively
     body_md = strip_ansi(body_md)
     payload_limit = MAX_JIRA_COMMENT
@@ -117,12 +151,14 @@ def jira_comment(key: str, body_md: str) -> None:
 
 # top-level helpers
 def write_debug_issue(issue_key: str, payload: dict) -> Path:
+    """Write raw Jira issue JSON to `.q/<issue>.issue.json` for debugging."""
     ensure_dirs()
     p = QDIR / f"{issue_key}.issue.json"
     import json
     p.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
     return p
 def _split_keys(envvar: str) -> list[str]:
+    """Split a comma-separated env var into a cleaned list of strings."""
     v = os.getenv(envvar, "")
     return [s.strip() for s in v.split(",") if s.strip()]
 
@@ -139,6 +175,7 @@ INLINE_TOKENS = [
 ]
 
 def _extract_section(text: str, keys: list[str]) -> str:
+    """Extract a named section from markdown-ish text using headings or inline tokens."""
     if not text:
         return ""
     heads = [rf"(?:^|\n)\s*#{{1,6}}\s*({h})\s*[:\-]*\s*\n" for h in keys] + \
@@ -175,12 +212,19 @@ def _extract_section(text: str, keys: list[str]) -> str:
     return ""
 
 def parse_sections_from_description(desc_text: str) -> dict:
+    """Parse acceptance criteria and tests sections out of a Jira description blob."""
     acceptance = _extract_section(desc_text, SECTION_HEADINGS["acceptance"])
     tests = _extract_section(desc_text, SECTION_HEADINGS["tests"])
     return {"acceptance_from_desc": acceptance, "tests_from_desc": tests}
 
 # update extract_fields to try custom fields, else fallback to parsed sections
 def extract_fields(issue: dict) -> dict:
+    """
+    Normalize a Jira issue into DevFlow’s internal fields dict.
+
+    Returns keys: summary, description, acceptance, tests, type.
+    Pulls data from configured custom fields first, then heuristics, then description parsing.
+    """
     f = issue.get("fields", {})
     summary = (f.get("summary") or "").strip()
     desc = f.get("description")
@@ -189,6 +233,7 @@ def extract_fields(issue: dict) -> dict:
 
     # env-configurable custom fields
     def _split_keys(envvar: str) -> list[str]:
+        """(Local helper) Split comma-separated env var values; scoped to this function."""
         v = os.getenv(envvar, "")
         return [s.strip() for s in v.split(",") if s.strip()]
 
@@ -240,8 +285,10 @@ def extract_fields(issue: dict) -> dict:
     }
 
 
+# Unit test
 
 def _junit_counts(junit_path: Path) -> dict:
+    """Return basic test counts from a JUnit XML file, or {} if the file is missing."""
     if not junit_path.exists():
         return {}
     root = ET.fromstring(junit_path.read_text())
@@ -255,6 +302,12 @@ def _junit_counts(junit_path: Path) -> dict:
     return totals
 
 def run_pytests(issue_key: str, report_path: Path) -> int:
+    """
+    LEGACY pytest runner (kept for context).
+
+    NOTE: `run_pytests` is intentionally redefined later in this file. In Python,
+    the later definition overrides this one; the CLI uses the later implementation.
+    """
     junit_path = QDIR / f"{issue_key}.junit.xml"
     # verbose, show all reports, do not stop early, include durations, clear cache
     cmd = [
@@ -306,8 +359,9 @@ def run_pytests(issue_key: str, report_path: Path) -> int:
     return r.returncode
 
 
-# add helpers below extract_fields
+
 def _slug(s: str) -> str:
+    """Convert free text to a short, URL/branch-safe slug."""
     s = s.lower()
     s = re.sub(r"\s+", "-", s)
     s = re.sub(r"[^a-z0-9\-]+", "-", s)
@@ -315,11 +369,12 @@ def _slug(s: str) -> str:
     return s[:80]  # keep short
 
 def make_branch_name(issue_type: str, key: str, title: str) -> str:
+    """Create a branch name like `<type>/<KEY>-<slugged-title>`."""
     return f"{_slug(issue_type)}/{key}-{_slug(title)}"
 
 
 def flatten_adf(node) -> str:
-    # Minimal Atlassian Document Format → text
+    """Flatten (minimal) Atlassian Document Format (ADF) nodes into plain text."""
     if node is None:
         return ""
     if isinstance(node, str):
@@ -332,9 +387,10 @@ def flatten_adf(node) -> str:
         return "".join(flatten_adf(c) for c in node)
     return ""
 
-# (removed duplicate extract_fields)
+
 
 def write_prompts(key: str, fields: dict) -> tuple[Path, Path]:
+    """Generate the `.q/<issue>.prompt.md` file used as the codegen prompt."""
     ensure_dirs()
     prompt = f"""# {key}: {fields['summary']}
 
@@ -366,6 +422,7 @@ Output actual working code files, not pseudocode.
 TEST_TABLE_ROW = re.compile(r"^\s*(TC[-_ ]?\d+)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*$", re.IGNORECASE)
 
 def _parse_test_table(text: str) -> list[dict]:
+    """Parse markdown table test cases into dicts: {id, scenario, steps, expected}."""
     if not text:
         return []
     lines = [l.strip() for l in text.splitlines() if l.strip()]
@@ -389,7 +446,7 @@ def _parse_test_table(text: str) -> list[dict]:
                     })
     return rows
 
-# NEW: parse vertical blocks where each TC is listed on separate lines
+# parse vertical blocks where each TC is listed on separate lines
 # Expect pattern like:
 # TC-001
 # Verify form layout
@@ -398,11 +455,13 @@ def _parse_test_table(text: str) -> list[dict]:
 VERT_TC_ID = re.compile(r"^\s*(TC[-_ ]?\d+)\s*$", re.IGNORECASE)
 
 def _parse_vertical_tests(text: str) -> list[dict]:
+    """Parse vertical/block-style test cases (TC id then scenario/steps/expected lines)."""
     if not text:
         return []
     raw_lines = text.splitlines()
     # keep original order, keep blanks to advance index correctly
     def next_nonempty(start: int) -> int:
+        """Return the index of the next non-empty line in `raw_lines`, else -1."""
         j = start
         while j < len(raw_lines) and not raw_lines[j].strip():
             j += 1
@@ -442,6 +501,7 @@ SIMPLE_TC = re.compile(r"\bTC[-_ ]?(\d{1,})\b", re.IGNORECASE)
 MINI_TC_SPLIT = re.compile(r"(TC[-_ ]?\d{1,})", re.IGNORECASE)
 
 def _parse_minified_tests(text: str) -> list[dict]:
+    """Parse minified/concatenated TC blocks when formatting is collapsed."""
     if not (text and "TC" in text):
         return []
     parts = MINI_TC_SPLIT.split(text)
@@ -469,6 +529,11 @@ def _parse_minified_tests(text: str) -> list[dict]:
 TESTS_ROOT = ROOT / "tests"
 
 def _ensure_tests_for_issue(issue_key: str, tests_text: str, desc_text: str) -> int:
+    """
+    Create missing pytest stub files for test cases referenced by TC ids.
+
+    Returns the count of newly created files (existing files are left unchanged).
+    """
     tests_dir = TESTS_ROOT / issue_key
     tests_dir.mkdir(parents=True, exist_ok=True)
 
@@ -509,14 +574,19 @@ def _ensure_tests_for_issue(issue_key: str, tests_text: str, desc_text: str) -> 
     return written
 
 def current_branch() -> str:
+    """Return the current git branch name."""
     return run(["git", "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
 
 
 
-# (legacy helper removed; use make_branch_name(issue_type, key, title) defined above)
 
 
 def create_branch(key: str, title: str, issue_type: str) -> None:
+    """
+    Create/switch to a branch derived from issue metadata.
+
+    Side effects: runs git commands, may stash/pop changes, and creates an empty commit.
+    """
     branch = make_branch_name(issue_type, key, title)
 
     # make sure we’re in a git repo
@@ -555,6 +625,7 @@ def create_branch(key: str, title: str, issue_type: str) -> None:
 
 
 def _junit_parse(junit_path: Path) -> tuple[dict, list[dict]]:
+    """Parse JUnit XML into (totals, cases) where cases include status and failure details."""
     if not junit_path.exists():
         return {}, []
     root = ET.fromstring(junit_path.read_text())
@@ -585,6 +656,7 @@ def _junit_parse(junit_path: Path) -> tuple[dict, list[dict]]:
 
 # Map a pytest test name/class to a TC id like "TC-001"
 def _tc_id_from_case(name: str, cls: str) -> str | None:
+    """Extract a normalized `TC-###` id from pytest test name/classname (best-effort)."""
     text = f"{cls}::{name}".lower()
     # match tc-001 or tc_001 or tc001
     m = re.search(r"\btc[-_]?([0-9]{1,})\b", text)
@@ -647,9 +719,16 @@ def post_tests_tc(issue_key: str, include_reason: bool = typer.Option(True, help
     # Post a very short plain comment
     jira_comment(issue_key, body)
     typer.echo(f"Posted per-TC summary for {len(lines)} cases.")
+    post_action(issue_key, f"Posted per-test-case (TC) summary for {len(lines)} case(s).", title="DevFlow Action")
 
 
 def run_pytests(issue_key: str, report_path: Path) -> int:
+    """
+    Run pytest for the repo and write a concise markdown report for this issue.
+
+    This is the *authoritative* `run_pytests` used by CLI commands (it overrides the
+    legacy implementation earlier in this file).
+    """
     junit_path = QDIR / f"{issue_key}.junit.xml"
     # verbose, show all reports, do not stop early, include durations
     r = run([
@@ -703,6 +782,7 @@ def run_pytests(issue_key: str, report_path: Path) -> int:
 
 
 def _to_adf_codeblock(text: str, title: str | None = None) -> dict:
+    """Build a minimal Atlassian Document Format (ADF) doc containing one code block."""
     # Simple, robust ADF: optional title paragraph + one code block
     content = []
     if title:
@@ -716,6 +796,12 @@ def _to_adf_codeblock(text: str, title: str | None = None) -> dict:
     return {"type": "doc", "version": 1, "content": content}
 
 def jira_comment(key: str, body_md: str, title: str | None = None) -> None:
+    """
+    Post a Jira comment using ADF code blocks (robust formatting + safe chunking).
+
+    This is the *authoritative* `jira_comment` used by the CLI (it overrides the
+    legacy plain-body `jira_comment` earlier in this file).
+    """
     # chunk and post multiple comments if needed
     i = 1
     start = 0
@@ -728,11 +814,17 @@ def jira_comment(key: str, body_md: str, title: str | None = None) -> None:
         jira_req("POST", f"/rest/api/3/issue/{key}/comment", json={"body": adf})
         i += 1
 
-import re
+
 
 FILE_HDR = re.compile(r"^#\s*file:\s*(?P<path>.+)$", re.IGNORECASE)
 
 def materialize_from_markdown(md_path: Path, root: Path = ROOT) -> int:
+    """
+    Write code blocks found in a markdown file into real files under `root`.
+
+    Expected pattern: a line like `# file: relative/path.py` before a fenced code block.
+    Returns the number of files written.
+    """
     text = md_path.read_text()
     blocks = re.split(r"^```", text, flags=re.MULTILINE)
     written = 0
@@ -762,6 +854,11 @@ def materialize_from_markdown(md_path: Path, root: Path = ROOT) -> int:
 
 
 def call_q(prompt_path: Path, out_path: Path, backend: str = "q") -> int:
+    """
+    Invoke the configured code generation backend and write a markdown transcript to `out_path`.
+
+    Returns the backend process return code.
+    """
     if backend == "q":
         qbin = os.getenv("Q_BIN", "q")
         r = run([qbin, "chat", "--no-interactive", "--trust-all-tools", prompt_path.read_text()], cwd=ROOT)
@@ -789,6 +886,7 @@ def materialize(issue_key: str):
         raise typer.Exit(1)
     n = materialize_from_markdown(md)
     typer.echo(f"Wrote {n} files from {md}")
+    post_action(issue_key, f"Materialized codegen output into {n} file(s).", title="DevFlow Action")
 
 # modify prepare() to print the extracted info to terminal
 @app.command()
@@ -806,7 +904,11 @@ def prepare(
     fields = extract_fields(issue)
     pth_prompt, pth_tests = write_prompts(issue_key, fields)
     if create_branch_flag:
+        branch = make_branch_name(fields["type"], issue_key, fields["summary"])
         create_branch(issue_key, fields["summary"], fields["type"])
+        post_action(issue_key, f"Ticket selected for development; git branch `{branch}` has been created.", title="DevFlow Action")
+    else:
+        post_action(issue_key, "Ticket selected for development; prompts prepared (branch creation disabled).", title="DevFlow Action")
 
     # concise terminal display
     def _short(s: str, n=400):
@@ -851,21 +953,26 @@ def post_tests_summary(issue_key: str):
     # Post concise comment to Jira
     jira_comment(issue_key, summary, title="Test Results")
     typer.echo(f"Posted summarized test results to Jira for {issue_key}")
+    post_action(issue_key, "Posted unit test summary.", title="DevFlow Action")
 
 # --- ADF helpers for Jira detailed test report ---
 def _adf_para(text: str) -> dict:
+    """Create an ADF paragraph block containing plain text."""
     return {"type":"paragraph","content":[{"type":"text","text":text}]}
 
 def _adf_code(text: str, lang: str="text") -> dict:
+    """Create an ADF code-block block with the given language."""
     return {"type":"codeBlock","attrs":{"language":lang},"content":[{"type":"text","text":text}]}
 
 def _adf_table(headers: list[str], rows: list[list[str]]) -> dict:
+    """Create an ADF table block from headers and row cells (all rendered as text)."""
     def _cell(t): return {"type":"tableCell","content":[{"type":"paragraph","content":[{"type":"text","text":t}]}]}
     head_row = {"type":"tableRow","content":[_cell(h) for h in headers]}
     body_rows = [{"type":"tableRow","content":[_cell(c) for c in r]} for r in rows]
     return {"type":"table","content":[head_row]+body_rows}
 
 def _adf_doc(blocks: list[dict]) -> dict:
+    """Wrap ADF blocks into a top-level ADF doc payload."""
     return {"type":"doc","version":1,"content":blocks}
 
 
@@ -922,6 +1029,7 @@ def post_tests_detailed(issue_key: str, include_logs: bool = typer.Option(False,
                 i += 1
 
     typer.echo("Posted detailed test report to Jira.")
+    post_action(issue_key, "Posted detailed unit test report.", title="DevFlow Action")
 
 
 # --- Concise per-TC table posting ---
@@ -974,6 +1082,7 @@ def post_tests_table(issue_key: str, run_first: bool = typer.Option(True, help="
     body = "\n".join(lines)
     jira_comment(issue_key, body)
     typer.echo(f"Posted per-TC table for {len(agg)} cases.")
+    post_action(issue_key, f"Posted per-TC results table for {len(agg)} case(s).", title="DevFlow Action")
 
 
 @app.command()
@@ -988,6 +1097,7 @@ def open(issue_key: str, editor: Optional[str] = None):
         typer.echo("Editor not found. Pass --editor path or install VS Code.")
         raise typer.Exit(code=1)
     subprocess.Popen([editor_cmd, "--reuse-window", str(prompt_path)])
+    post_action(issue_key, "Opened prompt for development editing.", title="DevFlow Action")
 
 @app.command()
 def codegen(issue_key: str):
@@ -999,6 +1109,7 @@ def codegen(issue_key: str):
         raise typer.Exit(code=1)
     rc = call_q(p, out)
     typer.echo(f"Q completed rc={rc}. Output: {out}")
+    post_action(issue_key, f"Code generation completed (rc={rc}); output saved to `{out.name}`.", title="DevFlow Action")
 
 @app.command()
 def test(issue_key: str):
@@ -1012,6 +1123,7 @@ def test(issue_key: str):
     _ = _ensure_tests_for_issue(issue_key, fields.get("tests") or "", fields.get("description") or "")
     rc = run_pytests(issue_key, report)
     typer.echo(f"pytest rc={rc}. Report: {report}")
+    post_action(issue_key, f"Tests executed (rc={rc}); report saved to `{report.name}`.", title="DevFlow Action")
 
 
 
@@ -1034,6 +1146,8 @@ def post(
             jira_comment(issue_key, t.read_text())
             posted.append("tests")
     typer.echo("Posted: " + ",".join(posted) if posted else "Nothing to post.")
+    if posted:
+        post_action(issue_key, f"Posted artifacts to Jira: {', '.join(posted)}.", title="DevFlow Action")
 
 @app.command()
 def commit(issue_key: str, msg: str = typer.Option("", "--msg", "-m")):
@@ -1044,7 +1158,11 @@ def commit(issue_key: str, msg: str = typer.Option("", "--msg", "-m")):
         summary = ""
     body = f"feat({issue_key}): {msg or summary}"
     run(["git", "add", "-A"])
-    run(["git", "commit", "-m", body])
+    r = run(["git", "commit", "-m", body])
+    # Best-effort action log: don't fail the command if git output is unexpected.
+    if r.returncode == 0:
+        sha = run(["git", "rev-parse", "--short", "HEAD"]).stdout.strip()
+        post_action(issue_key, f"Committed changes: {sha} ({body}).", title="DevFlow Action")
 
 @app.command()
 def pr():
@@ -1056,6 +1174,7 @@ def pr():
     run(["gh", "pr", "create", "--fill", "--head", branch])
 
 def _collect_failures_from_junit(issue_key: str) -> list[dict]:
+    """Collect failing/error testcases from JUnit as structured dicts for prompt building."""
     junit_path = QDIR / f"{issue_key}.junit.xml"
     _, cases = _junit_parse(junit_path)
     out = []
@@ -1084,6 +1203,7 @@ def _read_text_report(issue_key: str, max_chars: int = 4000) -> str:
 
 
 def _build_fix_prompt(issue_key: str) -> Path:
+    """Build `.q/<issue>.fixprompt.md` from failing tests + report excerpts, to feed into codegen."""
     junit_path = QDIR / f"{issue_key}.junit.xml"
     fails = _collect_failures_from_junit(issue_key) if junit_path.exists() else []
     text_report = _read_text_report(issue_key)
@@ -1141,14 +1261,17 @@ def fix_failures(
     out = QDIR / f"{issue_key}.codegen_fix.md"
     _ = call_q(prompt, out)
     typer.echo(f"Q fix completed. Output: {out}")
+    post_action(issue_key, f"Generated fix suggestions; output saved to `{out.name}`.", title="DevFlow Action")
     # Apply and re-test
+    applied_n = 0
     if materialize:
-        n = materialize_from_markdown(out)
-        typer.echo(f"Applied {n} files from codegen fix output")
+        applied_n = materialize_from_markdown(out)
+        typer.echo(f"Applied {applied_n} files from codegen fix output")
     if test_after:
         _cleanup_pytest_artifacts(ROOT)
         report2 = QDIR / f"{issue_key}.tests.out.md"
-        _ = run_pytests(issue_key, report2)
+        rc2 = run_pytests(issue_key, report2)
+        post_action(issue_key, f"Re-ran tests after fixes (rc={rc2}); report saved to `{report2.name}`.", title="DevFlow Action")
     if post_table:
         # Use existing posting logic by building and sending the concise table
         junit_path = QDIR / f"{issue_key}.junit.xml"
@@ -1177,6 +1300,7 @@ def fix_failures(
                 lines.append(f"{tcid} | {to_upper_status(row['status'])} | {row.get('time',0.0):.3f} | {row.get('reason','')}")
             jira_comment(issue_key, "\n".join(lines))
             typer.echo("Posted concise per-TC table to Jira")
+            post_action(issue_key, f"Posted concise per-TC table after fix-failures (applied {applied_n} file(s)).", title="DevFlow Action")
         else:
             typer.echo("No testcases found in JUnit to post.")
 
