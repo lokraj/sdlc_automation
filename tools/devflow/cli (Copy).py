@@ -117,10 +117,19 @@ def post_action(issue_key: str, message: str, title: str = "DevFlow") -> None:
     - Posts a single-line informational comment to the Jira issue.
     - Never raises (so it won't break workflows when Jira env isn't configured).
     """
-    if not (JIRA_BASE and JIRA_EMAIL and JIRA_TOKEN):
-        return
     msg = " ".join((message or "").strip().split())
     if not msg:
+        return
+    # Always persist a local action timeline (useful for later technical documentation).
+    try:
+        ensure_dirs()
+        p = QDIR / f"{issue_key}.actions.log"
+        ts = datetime.now().isoformat(timespec="seconds")
+        p.write_text(p.read_text(errors="ignore") + f"{ts} {msg}\n" if p.exists() else f"{ts} {msg}\n")
+    except Exception:
+        pass
+
+    if not (JIRA_BASE and JIRA_EMAIL and JIRA_TOKEN):
         return
     try:
         # Uses the *authoritative* `jira_comment` defined later in this module.
@@ -357,6 +366,86 @@ def run_pytests(issue_key: str, report_path: Path) -> int:
 """
     report_path.write_text(body)
     return r.returncode
+
+def _git_base_ref() -> str:
+    """Return the best available base ref (prefers remote base branch if it exists)."""
+    remote = f"{GIT_REMOTE}/{BASE_BRANCH}"
+    if run(["git", "show-ref", "--verify", f"refs/remotes/{remote}"]).returncode == 0:
+        return remote
+    return BASE_BRANCH
+
+def _safe_read_actions(issue_key: str) -> str:
+    """Read the persisted `.q/<issue>.actions.log` timeline if present."""
+    p = QDIR / f"{issue_key}.actions.log"
+    if not p.exists():
+        return ""
+    return p.read_text(errors="ignore").strip()
+
+def _tech_summary(issue_key: str, base_ref: str) -> str:
+    """
+    Build a technical completion summary for a ticket.
+
+    Includes: branch, commit range, changed files summary, test summary (if present),
+    and the local action timeline captured by `post_action()`.
+    """
+    ensure_dirs()
+    branch = current_branch()
+    # Git summaries (best-effort, never raise here)
+    diffstat = run(["git", "diff", "--stat", f"{base_ref}...HEAD"]).stdout.strip()
+    name_status = run(["git", "diff", "--name-status", f"{base_ref}...HEAD"]).stdout.strip()
+    commits = run(["git", "log", "--oneline", f"{base_ref}..HEAD"]).stdout.strip()
+
+    junit_path = QDIR / f"{issue_key}.junit.xml"
+    totals = {}
+    if junit_path.exists():
+        totals, _ = _junit_parse(junit_path)
+    test_summary = ""
+    if totals:
+        test_summary = (
+            f"{totals.get('passed',0)} passed, {totals.get('failures',0)} failed, "
+            f"{totals.get('errors',0)} errors, {totals.get('skipped',0)} skipped, "
+            f"total {totals.get('tests',0)}"
+        )
+
+    actions = _safe_read_actions(issue_key)
+
+    prompt_path = QDIR / f"{issue_key}.prompt.md"
+    prompt_hint = f"`{prompt_path}`" if prompt_path.exists() else "(missing)"
+
+    lines = []
+    lines.append(f"# Technical Summary — {issue_key}")
+    lines.append("")
+    lines.append("## Context")
+    lines.append(f"- Branch: `{branch}`")
+    lines.append(f"- Base ref: `{base_ref}`")
+    lines.append(f"- Prompt: {prompt_hint}")
+    if test_summary:
+        lines.append(f"- Latest tests: {test_summary}")
+    lines.append("")
+    lines.append("## Git changes")
+    lines.append("")
+    lines.append("### Diffstat")
+    lines.append("```text")
+    lines.append(diffstat or "(no diffstat available)")
+    lines.append("```")
+    lines.append("")
+    lines.append("### Changed files")
+    lines.append("```text")
+    lines.append(name_status or "(no changed files listed)")
+    lines.append("```")
+    lines.append("")
+    lines.append("### Commits")
+    lines.append("```text")
+    lines.append(commits or "(no commits in this range)")
+    lines.append("```")
+    lines.append("")
+    if actions:
+        lines.append("## DevFlow action timeline")
+        lines.append("```text")
+        lines.append(actions)
+        lines.append("```")
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
 
 
 
@@ -853,7 +942,7 @@ def materialize_from_markdown(md_path: Path, root: Path = ROOT) -> int:
     return written
 
 
-def call_q(prompt_path: Path, out_path: Path, backend: str = "q") -> int:
+def call_q(prompt_path: Path, out_path: Path, backend: str = "q", stream: bool = True) -> int:
     """
     Invoke the configured code generation backend and write a markdown transcript to `out_path`.
 
@@ -861,7 +950,52 @@ def call_q(prompt_path: Path, out_path: Path, backend: str = "q") -> int:
     """
     if backend == "q":
         qbin = os.getenv("Q_BIN", "q")
-        r = run([qbin, "chat", "--no-interactive", "--trust-all-tools", prompt_path.read_text()], cwd=ROOT)
+        prompt = prompt_path.read_text()
+        if stream:
+            # Stream Q output live to the terminal while also capturing it for the markdown transcript.
+            # We merge stderr into stdout for simple real-time display.
+            #
+            # IMPORTANT: stream by *bytes/chunks* (not by readline) so the user sees progress even
+            # when the backend doesn't emit newline-terminated lines (e.g., spinners/progress).
+            p = subprocess.Popen(
+                [qbin, "chat", "--no-interactive", "--trust-all-tools"],
+                cwd=str(ROOT),
+                text=False,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=0,
+            )
+            if p.stdin is None or p.stdout is None:
+                raise RuntimeError("Failed to start streaming subprocess (missing pipes).")
+
+            try:
+                p.stdin.write(prompt.encode("utf-8", errors="replace"))
+            finally:
+                p.stdin.close()
+
+            out_buf = bytearray()
+            while True:
+                chunk = p.stdout.read(1024)
+                if not chunk:
+                    break
+                out_buf.extend(chunk)
+                # Real-time user visibility in the terminal
+                sys.stdout.buffer.write(chunk)
+                sys.stdout.flush()
+
+            rc = p.wait()
+            r = subprocess.CompletedProcess([], rc, stdout=out_buf.decode("utf-8", errors="replace"), stderr="")
+        else:
+            # Non-streaming mode: capture stdout/stderr.
+            r = subprocess.run(
+                [qbin, "chat", "--no-interactive", "--trust-all-tools"],
+                cwd=str(ROOT),
+                text=True,
+                capture_output=True,
+                check=False,
+                input=prompt,
+            )
     else:
         # Unknown backend; echo prompt
         r = subprocess.CompletedProcess([], 0, stdout=prompt_path.read_text(), stderr="")
@@ -1100,16 +1234,42 @@ def open(issue_key: str, editor: Optional[str] = None):
     post_action(issue_key, "Opened prompt for development editing.", title="DevFlow Action")
 
 @app.command()
-def codegen(issue_key: str):
+def codegen(
+    issue_key: str,
+    stream: bool = typer.Option(True, "--stream/--no-stream", help="Stream Amazon Q output live in the terminal"),
+):
     """Drive Amazon Q CLI non-interactively for code generation."""
     p = QDIR / f"{issue_key}.prompt.md"
     out = QDIR / f"{issue_key}.codegen.md"
     if not p.exists():
         typer.echo("Prompt not found. Run prepare.")
         raise typer.Exit(code=1)
-    rc = call_q(p, out)
+    rc = call_q(p, out, stream=stream)
     typer.echo(f"Q completed rc={rc}. Output: {out}")
     post_action(issue_key, f"Code generation completed (rc={rc}); output saved to `{out.name}`.", title="DevFlow Action")
+
+@app.command("doc")
+def doc(
+    issue_key: str,
+    post_to_jira: bool = typer.Option(True, "--post/--no-post", help="Post the technical summary to Jira as a comment"),
+    base_ref: str = typer.Option("", help="Git base ref for diff/log (default: remote base branch if available)"),
+):
+    """
+    Generate a technical completion summary for a ticket.
+
+    Writes `.q/<issue>.tech.md` and optionally posts it to Jira.
+    """
+    ensure_dirs()
+    base = (base_ref or "").strip() or _git_base_ref()
+    out_path = QDIR / f"{issue_key}.tech.md"
+    text = _tech_summary(issue_key, base)
+    out_path.write_text(text)
+    typer.echo(f"Wrote technical summary: {out_path}")
+    if post_to_jira:
+        # Best-effort (will chunk via `jira_comment` if large).
+        jira_comment(issue_key, text, title="Technical Summary")
+        typer.echo("Posted technical summary to Jira.")
+    post_action(issue_key, f"Generated technical summary `{out_path.name}` (base `{base}`).", title="DevFlow Action")
 
 @app.command()
 def test(issue_key: str):
